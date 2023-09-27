@@ -167,6 +167,72 @@ class JobController extends RestController
     $error = new Info(400, "Folder id and upload id should be integers!", InfoType::ERROR);
     return $response->withJson($error->getArray(), $error->getCode());
   }
+
+  /**
+   * Delete a job using it's Job ID and Queue ID. Job ID is job_pk in job table
+   * and Queue ID is jobqueue_pk in jobqueue table
+   *
+   * @param ServerRequestInterface $request
+   * @param ResponseHelper $response
+   * @param array $args
+   * @return ResponseHelper
+   */
+  public function deleteJob($request, $response, $args)
+  {
+    $userId = $this->restHelper->getUserId();
+    $userName = $this->restHelper->getUserDao()->getUserName($userId);
+
+    /* Check if the job exists */
+    $jobId  = intval($args['id']);
+    if (! $this->dbHelper->doesIdExist("job", "job_pk", $jobId)) {
+      $returnVal = new Info(404, "Job id " . $jobId . " doesn't exist",
+        InfoType::ERROR);
+      return $response->withJson($returnVal->getArray(), $returnVal->getCode());
+    }
+
+    /* Check if user has permission to delete this job*/
+    $canDeleteJob = $this->restHelper->getJobDao()->hasActionPermissionsOnJob($jobId, $userId, $this->restHelper->getGroupId());
+    if (! $canDeleteJob) {
+      $returnVal = new Info(403, "You don't have permission to delete this job.",
+        InfoType::ERROR);
+      return $response->withJson($returnVal->getArray(), $returnVal->getCode());
+    }
+
+    $queueId = $args['queue'];
+
+    /* Get Jobs that depend on the job to be deleted */
+    $JobQueue = $this->restHelper->getShowJobDao()->getJobInfo([$jobId])[$jobId]["jobqueue"];
+
+    $dependentJobs = [];
+
+    if (array_key_exists($queueId, $JobQueue)) {
+      $dependentJobs[] = $queueId;
+    } else {
+      $returnVal = new Info(404, "Job queue " . $queueId . " doesn't exist in Job " . $jobId,
+        InfoType::ERROR);
+      return $response->withJson($returnVal->getArray(), $returnVal->getCode());
+    }
+
+    foreach ($JobQueue as $job) {
+      if (in_array($queueId, $job["depends"])) {
+        $dependentJobs[] = $job["jq_pk"];
+      }
+    }
+
+    /* Delete All jobs in dependentJobs */
+    foreach ($dependentJobs as $job) {
+      $Msg = "\"" . _("Killed by") . " " . $userName . "\"";
+      $command = "kill $job $Msg";
+      $rv = fo_communicate_with_scheduler($command, $response_from_scheduler, $error_info);
+      if ($rv == false) {
+        $returnVal = new Info(500, "Failed to kill job $jobId", InfoType::ERROR);
+        return $response->withJson($returnVal->getArray(), $returnVal->getCode());
+      }
+    }
+    $returnVal = new Info(200, "Job deleted successfully", InfoType::INFO);
+    return $response->withJson($returnVal->getArray(), $returnVal->getCode());
+  }
+
   /**
    * Get all jobs created by the current user.
    *
@@ -443,5 +509,73 @@ class JobController extends RestController
   private function compareJobsInfo($JobsInfo1, $JobsInfo2)
   {
     return $JobsInfo2["job"]["job_pk"] - $JobsInfo1["job"]["job_pk"];
+  }
+
+  /**
+   * @brief Get the summary statistics of all the jobs
+   * @param Request $request
+   * @param ResponseHelper $response
+   * @param array $args
+   * @return ResponseHelper
+   */
+  public function getJobStatistics($request, $response, $args)
+  {
+    if (!Auth::isAdmin()) {
+      $error = new Info(403, "Only Admin can access the endpoint.", InfoType::ERROR);
+      return $response->withJson($error->getArray(), $error->getCode());
+    }
+    $statisticsPlugin = $this->restHelper->getPlugin('dashboard-statistics');
+    $res = $statisticsPlugin->CountAllJobs(true);
+    return $response->withJson($res, 200);
+  }
+
+  /**
+   * Get all the server jobs with status
+   *
+   * @param Request $request
+   * @param ResponseHelper $response
+   * @param array $args
+   * @return ResponseHelper
+   */
+  public function getAllServerJobsStatus($request, $response, $args)
+  {
+    if (!Auth::isAdmin()) {
+      $error = new Info(403, "Only Admin can access the endpoint.", InfoType::ERROR);
+      return $response->withJson($error->getArray(), $error->getCode());
+    }
+    $allJobStatusPlugin = $this->restHelper->getPlugin('ajax_all_job_status');
+    $symfonyRequest = new \Symfony\Component\HttpFoundation\Request();
+    $res = $allJobStatusPlugin->handle($symfonyRequest);
+    return $response->withJson(json_decode($res->getContent(), true), 200);
+  }
+
+  /**
+   * @brief Get the scheduler job options for a given operation
+   * @param Request $request
+   * @param ResponseHelper $response
+   * @param array $args
+   * @return ResponseHelper
+   */
+  public function getSchedulerJobOptionsByOperation($request, $response, $args)
+  {
+    $operation = $args['operationName'];
+    $adminSchedulerPlugin = $this->restHelper->getPlugin('admin_scheduler');
+    if (!Auth::isAdmin()) {
+      $error = new Info(403, "Only Admin can access the endpoint.", InfoType::ERROR);
+      return $response->withJson($error->getArray(), $error->getCode());
+    }
+
+    if (!in_array($operation, array_keys($adminSchedulerPlugin->operation_array))) {
+      $allowedOperations = implode(', ', array_keys($adminSchedulerPlugin->operation_array));
+      $error = new Info(400, "Operation '$operation' not allowed. Allowed operations are: $allowedOperations", InfoType::ERROR);
+      return $response->withJson($error->getArray(), $error->getCode());
+    }
+
+    $schedulerPlugin = $this->restHelper->getPlugin('ajax_admin_scheduler');
+    $symfonyRequest = new \Symfony\Component\HttpFoundation\Request();
+    $symfonyRequest->request->set('operation', $operation);
+    $symfonyRequest->request->set('fromRest', true);
+    $res = $schedulerPlugin->handle($symfonyRequest);
+    return $response->withJson($res, 200);
   }
 }

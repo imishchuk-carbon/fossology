@@ -2,6 +2,7 @@
 /*
  SPDX-FileCopyrightText: © 2017-2018,2021 Siemens AG
  SPDX-FileCopyrightText: © 2021 Orange by Piotr Pszczola <piotr.pszczola@orange.com>
+ SPDX-FileCopyrightText: © 2023 Samuel Dushimimana <dushsam100@gmail.com>
 
  SPDX-License-Identifier: GPL-2.0-only
 */
@@ -27,17 +28,24 @@ use Fossology\UI\Api\Controllers\FileSearchController;
 use Fossology\UI\Api\Controllers\FolderController;
 use Fossology\UI\Api\Controllers\GroupController;
 use Fossology\UI\Api\Controllers\InfoController;
+use Fossology\UI\Api\Controllers\FileInfoController;
 use Fossology\UI\Api\Controllers\JobController;
+use Fossology\UI\Api\Controllers\CopyrightController;
 use Fossology\UI\Api\Controllers\LicenseController;
 use Fossology\UI\Api\Controllers\MaintenanceController;
+use Fossology\UI\Api\Controllers\OverviewController;
 use Fossology\UI\Api\Controllers\ReportController;
 use Fossology\UI\Api\Controllers\SearchController;
+use Fossology\UI\Api\Controllers\ConfController;
 use Fossology\UI\Api\Controllers\UploadController;
+use Fossology\UI\Api\Controllers\UploadTreeController;
 use Fossology\UI\Api\Controllers\UserController;
+use Fossology\UI\Api\Controllers\CustomiseController;
 use Fossology\UI\Api\Helper\ResponseFactoryHelper;
 use Fossology\UI\Api\Helper\ResponseHelper;
 use Fossology\UI\Api\Middlewares\FossologyInitMiddleware;
 use Fossology\UI\Api\Middlewares\RestAuthMiddleware;
+use Fossology\UI\Api\Models\ApiVersion;
 use Fossology\UI\Api\Models\Info;
 use Fossology\UI\Api\Models\InfoType;
 use Psr\Http\Message\ServerRequestInterface;
@@ -46,16 +54,28 @@ use Slim\Exception\HttpMethodNotAllowedException;
 use Slim\Exception\HttpNotFoundException;
 use Slim\Factory\AppFactory;
 use Slim\Middleware\ContentLengthMiddleware;
+use Slim\Psr7\Request;
 use Slim\Psr7\Response;
 use Throwable;
 
-const REST_VERSION = "1";
+// Extracts the version from the URL
+function getVersionFromUri ($uri)
+{
+  $matches = [];
+  preg_match('/\/repo\/api\/v(\d+)/', $uri, $matches);
+  return isset($matches[1]) ? intval($matches[1]) : null;
+}
 
-const BASE_PATH   = "/repo/api/v" . REST_VERSION;
+// Determine the API version based on the URL
+$requestedVersion = isset($_SERVER['REQUEST_URI']) ? getVersionFromUri($_SERVER['REQUEST_URI']) : null;
+$apiVersion = in_array($requestedVersion, [ApiVersion::V1, ApiVersion::V2]) ? $requestedVersion : ApiVersion::V1; // Default to "1"
+
+// Construct the base path
+$BASE_PATH = "/repo/api/v" .$apiVersion;
 
 const AUTH_METHOD = "JWT_TOKEN";
 
-$GLOBALS['apiBasePath'] = BASE_PATH;
+$GLOBALS['apiBasePath'] = $BASE_PATH;
 
 $startTime = microtime(true);
 
@@ -90,9 +110,15 @@ if ($dbConnected) {
 AppFactory::setContainer($container);
 AppFactory::setResponseFactory(new ResponseFactoryHelper());
 $app = AppFactory::create();
-$app->setBasePath(BASE_PATH);
+$app->setBasePath($BASE_PATH);
 
-/*
+// Custom middleware to set the API version as a request attribute
+$apiVersionMiddleware = function (Request $request, $handler) use ($apiVersion) {
+  $request = $request->withAttribute('apiVersion', $apiVersion);
+  return $handler->handle($request);
+};
+
+/*./
  * To check the order of middlewares, refer
  * https://www.slimframework.com/docs/v4/concepts/middleware.html
  *
@@ -103,6 +129,7 @@ $app->setBasePath(BASE_PATH);
  * 3. The normal flow continues.
  * 4. The call now enters FOSSology Init again and plugins are unloaded.
  * 5. The call then enters Rest Auth and leaves as is.
+ * 6. Added ApiVersion middleware to set 'apiVersion' attribute in request.
  */
 if ($dbConnected) {
   // Middleware for plugin initialization
@@ -111,6 +138,8 @@ if ($dbConnected) {
   $app->add(new RestAuthMiddleware());
   // Content length middleware
   $app->add(new ContentLengthMiddleware());
+  // Api version middleware
+  $app->add($apiVersionMiddleware);
 } else {
   // DB not connected
   // Respond to health request as expected
@@ -147,10 +176,38 @@ $app->group('/uploads',
     $app->get('/{id:\\d+}/perm-groups', UploadController::class . ':getGroupsWithPermissions');
     $app->get('/{id:\\d+}/summary', UploadController::class . ':getUploadSummary');
     $app->get('/{id:\\d+}/licenses', UploadController::class . ':getUploadLicenses');
+    $app->get('/{id:\\d+}/licenses/histogram', UploadController::class . ':getLicensesHistogram');
+    $app->get('/{id:\\d+}/agents', UploadController::class . ':getAllAgents');
+    $app->get('/{id:\\d+}/licenses/edited', UploadController::class . ':getEditedLicenses');
+    $app->get('/{id:\\d+}/licenses/reuse', UploadController::class . ':getReuseReportSummary');
+    $app->get('/{id:\\d+}/licenses/scanned', UploadController::class . ':getScannedLicenses');
+    $app->get('/{id:\\d+}/agents/revision', UploadController::class . ':getAgentsRevision');
+    $app->put('/{id:\\d+}/item/{itemId:\\d+}/licenses', UploadTreeController::class . ':handleAddEditAndDeleteLicenseDecision');
     $app->get('/{id:\\d+}/download', UploadController::class . ':uploadDownload');
     $app->get('/{id:\\d+}/copyrights', UploadController::class . ':getUploadCopyrights');
+    $app->get('/{id:\\d+}/clearing-progress', UploadController::class . ':getClearingProgressInfo');
+    $app->get('/{id:\\d+}/licenses/main', UploadController::class . ':getMainLicenses');
+    $app->post('/{id:\\d+}/licenses/main', UploadController::class . ':setMainLicense');
+    $app->delete('/{id:\\d+}/licenses/{shortName:[\\w\\- \\.]+}/main', UploadController::class . ':removeMainLicense');
+    $app->get('/{id:\\d+}/item/{itemId:\\d+}/view', UploadTreeController::class. ':viewLicenseFile');
+    $app->get('/{id:\\d+}/item/{itemId:\\d+}/prev-next', UploadTreeController::class . ':getNextPreviousItem');
+    $app->get('/{id:\\d+}/item/{itemId:\\d+}/licenses', UploadTreeController::class . ':getLicenseDecisions');
+    $app->get('/{id:\\d+}/item/{itemId:\\d+}/copyrights', CopyrightController::class . ':getFileCopyrights');
+    $app->delete('/{id:\\d+}/item/{itemId:\\d+}/copyrights/{hash:.*}', CopyrightController::class . ':deleteFileCopyrights');
+    $app->put('/{id:\\d+}/item/{itemId:\\d+}/copyrights/{hash:.*}', CopyrightController::class . ':updateFileCopyrights');
+    $app->put('/{id:\\d+}/item/{itemId}/clearing-decision', UploadTreeController::class . ':setClearingDecision');
+    $app->get('/{id:\\d+}/item/{itemId:\\d+}/bulk-history', UploadTreeController::class . ':getBulkHistory');
+    $app->get('/{id:\\d+}/item/{itemId:\\d+}/clearing-history', UploadTreeController::class . ':getClearingHistory');
+    $app->get('/{id:\\d+}/item/{itemId:\\d+}/highlight', UploadTreeController::class . ':getHighlightEntries');
+    $app->patch('/{id:\\d+}/item/{itemId:\\d+}/copyrights/{hash:.*}', CopyrightController::class . ':restoreFileCopyrights');
+    $app->get('/{id:\\d+}/item/{itemId:\\d+}/totalcopyrights', CopyrightController::class . ':getTotalFileCopyrights');
+    $app->get('/{id:\\d+}/item/{itemId:\\d+}/tree/view', UploadTreeController::class . ':getTreeView');
+    $app->get('/{id:\\d+}/item/{itemId:\\d+}/info', FileInfoController::class . ':getItemInfo');
+    $app->post('/{id:\\d+}/item/{itemId:\\d+}/bulk-scan', UploadTreeController::class . ':scheduleBulkScan');
+    $app->get('/{id:\\d+}/conf', ConfController::class . ':getConfInfo');
     $app->any('/{params:.*}', BadRequestController::class);
   });
+
 
 ////////////////////////////ADMIN-USERS/////////////////////
 $app->group('/users',
@@ -184,8 +241,12 @@ $app->group('/jobs',
   function (\Slim\Routing\RouteCollectorProxy $app) {
     $app->get('[/{id:\\d+}]', JobController::class . ':getJobs');
     $app->get('/all', JobController::class . ':getAllJobs');
+    $app->get('/dashboard/statistics', JobController::class . ':getJobStatistics');
+    $app->get('/scheduler/operation/{operationName:[\\w\\- \\.]+}', JobController::class . ':getSchedulerJobOptionsByOperation');
     $app->post('', JobController::class . ':createJob');
     $app->get('/history', JobController::class . ':getJobsHistory');
+    $app->get('/dashboard', JobController::class . ':getAllServerJobsStatus');
+    $app->delete('/{id:\\d+}/{queue:\\d+}', JobController::class . ':deleteJob');
     $app->any('/{params:.*}', BadRequestController::class);
   });
 
@@ -223,6 +284,12 @@ $app->group('/report',
     $app->any('/{params:.*}', BadRequestController::class);
   });
 
+/////////////////////////CUSTOMISE////////////////////
+$app->group('/customise',
+  function (\Slim\Routing\RouteCollectorProxy $app) {
+    $app->get('', CustomiseController::class . ':getCustomiseData');
+  });
+
 ////////////////////////////INFO/////////////////////
 $app->group('/version',
   function (\Slim\Routing\RouteCollectorProxy $app) {
@@ -235,6 +302,10 @@ $app->group('/info',
 $app->group('/health',
   function (\Slim\Routing\RouteCollectorProxy $app) {
     $app->get('', InfoController::class . ':getHealth');
+  });
+$app->group('/openapi',
+  function (\Slim\Routing\RouteCollectorProxy $app) {
+    $app->get('', InfoController::class . ':getOpenApi');
   });
 
 /////////////////////////FILE SEARCH////////////////////
@@ -250,11 +321,29 @@ $app->group('/license',
     $app->get('', LicenseController::class . ':getAllLicenses');
     $app->post('/import-csv', LicenseController::class . ':handleImportLicense');
     $app->post('', LicenseController::class . ':createLicense');
+    $app->put('/verify/{shortname:.+}', LicenseController::class . ':verifyLicense');
+    $app->put('/merge/{shortname:.+}', LicenseController::class . ':mergeLicense');
     $app->get('/admincandidates', LicenseController::class . ':getCandidates');
+    $app->get('/adminacknowledgements', LicenseController::class . ':getAllAdminAcknowledgements');
+    $app->get('/stdcomments', LicenseController::class . ':getAllLicenseStandardComments');
+    $app->put('/stdcomments', LicenseController::class . ':handleLicenseStandardComment');
+    $app->post('/suggest', LicenseController::class . ':getSuggestedLicense');
     $app->get('/{shortname:.+}', LicenseController::class . ':getLicense');
     $app->patch('/{shortname:.+}', LicenseController::class . ':updateLicense');
     $app->delete('/admincandidates/{id:\\d+}',
       LicenseController::class . ':deleteAdminLicenseCandidate');
+    $app->put('/adminacknowledgements', LicenseController::class . ':handleAdminLicenseAcknowledgement');
+    $app->any('/{params:.*}', BadRequestController::class);
+  });
+
+////////////////////////////OVERVIEW/////////////////////
+$app->group('/overview',
+  function (\Slim\Routing\RouteCollectorProxy $app) {
+    $app->get('/database/contents', OverviewController::class . ':getDatabaseContents');
+    $app->get('/disk/usage', OverviewController::class . ':getDiskSpaceUsage');
+    $app->get('/info/php', OverviewController::class . ':getPhpInfo');
+    $app->get('/database/metrics', OverviewController::class . ':getDatabaseMetrics');
+    $app->get('/queries/active', OverviewController::class . ':getActiveQueries');
     $app->any('/{params:.*}', BadRequestController::class);
   });
 
